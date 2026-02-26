@@ -1,3 +1,3 @@
-"""MicroPKI - A minimal Public Key Infrastructure tool."""
+"""MicroPKI - Минималистичный инструмент для инфраструктуры открытых ключей."""
 
 __version__ = "0.1.0"

@@ -1,15 +1,16 @@
 """
-HTTP certificate repository server for MicroPKI.
+HTTP-сервер репозитория сертификатов для MicroPKI.
 
-Serves certificates via REST-like endpoints using the built-in http.server.
-No external dependencies required.
+Отдает сертификаты через REST-подобные эндпоинты, используя встроенный http.server.
+Не требует внешних зависимостей.
 
-Endpoints:
-  GET /certificate/<serial>   — fetch cert PEM from DB
-  GET /ca/root                — Root CA certificate
-  GET /ca/intermediate        — Intermediate CA certificate
-  GET /crl                    — 501 placeholder
+Эндпоинты:
+  GET /certificate/<serial>   — получить PEM сертификата из БД
+  GET /ca/root                — Корневой сертификат (Root CA)
+  GET /ca/intermediate        — Промежуточный сертификат (Intermediate CA)
+  GET /crl                    — Заглушка (501)
 """
+
 
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
 
 
 class RepositoryHandler(BaseHTTPRequestHandler):
-    """HTTP request handler for the certificate repository."""
+    """Класс-обработчик HTTP запросов для репозитория сертификатов."""
 
     def __init__(self, db_path: str, cert_dir: str, *args, **kwargs):
         self.db_path = db_path
@@ -38,7 +39,7 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         super().__init__(*args, **kwargs)
 
     def log_message(self, format: str, *args) -> None:
-        """Override default logging to use our logger with [HTTP] prefix."""
+        """Переопределение стандартного логирования для использования нашего логгера с префиксом [HTTP]."""
         client_ip = self.client_address[0]
         logger.info(
             "[HTTP] %s %s - %s",
@@ -48,7 +49,7 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         )
 
     def do_GET(self) -> None:
-        """Route GET requests to appropriate handlers."""
+        """Маршрутизация GET-запросов к соответствующим обработчикам."""
         path = self.path.rstrip("/")
 
         if path.startswith("/certificate/"):
@@ -61,17 +62,17 @@ class RepositoryHandler(BaseHTTPRequestHandler):
             self._send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
     def do_HEAD(self) -> None:
-        """Handle HEAD requests (same routing, no body)."""
+        """Обработка HEAD-запросов (та же маршрутизация, но без тела ответа)."""
         self.do_GET()
 
     def _handle_certificate(self, serial: str) -> None:
-        """GET /certificate/<serial> — fetch cert from DB."""
+        """GET /certificate/<serial> — получение сертификата из БД."""
         serial = serial.strip()
 
         if not serial or not _HEX_RE.match(serial):
             self._send_error(
                 HTTPStatus.BAD_REQUEST,
-                f"Invalid serial number format: '{serial}'. Must be hexadecimal.",
+                f"Неверный формат серийного номера: '{serial}'. Ожидается шестнадцатеричное значение.",
             )
             return
 
@@ -79,14 +80,14 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         if record is None:
             self._send_error(
                 HTTPStatus.NOT_FOUND,
-                f"Certificate with serial '{serial}' not found.",
+                f"Сертификат с серийным номером '{serial}' не найден.",
             )
             return
 
         self._send_pem(record["cert_pem"])
 
     def _handle_ca(self, level: str) -> None:
-        """GET /ca/<level> — serve CA certificate from disk."""
+        """GET /ca/<level> — отдача файла сертификата УЦ с диска."""
         level = level.strip().lower()
 
         file_map = {
@@ -98,7 +99,7 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         if filename is None:
             self._send_error(
                 HTTPStatus.NOT_FOUND,
-                f"Unknown CA level: '{level}'. Use 'root' or 'intermediate'.",
+                f"Неизвестный уровень CA: '{level}'. Используйте 'root' или 'intermediate'.",
             )
             return
 
@@ -106,7 +107,7 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         if not cert_path.exists():
             self._send_error(
                 HTTPStatus.NOT_FOUND,
-                f"CA certificate file not found: {filename}",
+                f"Файл сертификата CA не найден: {filename}",
             )
             return
 
@@ -114,14 +115,14 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         self._send_pem(pem_data)
 
     def _handle_crl(self) -> None:
-        """GET /crl — placeholder for Sprint 4."""
+        """GET /crl — заглушка для Спринта 4."""
         self._send_error(
             HTTPStatus.NOT_IMPLEMENTED,
-            "CRL generation not yet implemented.",
+            "Генерация CRL пока не реализована.",
         )
 
     def _send_pem(self, pem_text: str) -> None:
-        """Send a PEM response with correct headers."""
+        """Отправка ответа в формате PEM с правильными заголовками."""
         body = pem_text.encode("utf-8")
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "application/x-pem-file")
@@ -131,7 +132,7 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _send_error(self, status: HTTPStatus, message: str) -> None:
-        """Send an error response in plain text."""
+        """Отправка ответа об ошибке в виде обычного текста."""
         body = message.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/plain; charset=utf-8")
@@ -148,25 +149,25 @@ def run_server(
     cert_dir: str = "./pki/certs",
 ) -> None:
     """
-    Start the HTTP certificate repository server.
+    Запуск HTTP-сервера репозитория сертификатов.
 
-    Runs until interrupted with Ctrl+C.
+    Работает до прерывания комбинацией Ctrl+C.
 
-    Args:
-        host: Bind address.
-        port: TCP port.
-        db_path: Path to the SQLite database.
-        cert_dir: Directory containing CA certificate PEM files.
+    Аргументы:
+        host: IP-адрес для привязки сервера.
+        port: TCP порт.
+        db_path: Путь к базе данных SQLite.
+        cert_dir: Директория, содержащая PEM-файлы сертификатов УЦ.
     """
     handler = partial(RepositoryHandler, db_path, cert_dir)
     server = HTTPServer((host, port), handler)
 
-    logger.info("Repository server starting on http://%s:%d", host, port)
-    logger.info("Database: %s, Cert dir: %s", db_path, cert_dir)
+    logger.info("Сервер репозитория запущен на http://%s:%d", host, port)
+    logger.info("База данных: %s, Директория сертификатов: %s", db_path, cert_dir)
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        logger.info("Repository server shutting down.")
+        logger.info("Сервер репозитория останавливается.")
     finally:
         server.server_close()

@@ -1,4 +1,4 @@
-"""Entry point for `python -m micropki`."""
+"""Точка входа для `python -m micropki`."""
 
 import sys
 

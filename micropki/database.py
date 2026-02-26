@@ -248,7 +248,7 @@ def get_revoked(db_path: str) -> list[dict[str, Any]]:
 
 
 def serial_exists(db_path: str, serial_hex: str) -> bool:
-    """Check if a serial number already exists in the database."""
+    """Проверяет, существует ли уже серийный номер в базе данных."""
     conn = _connect(db_path)
     try:
         row = conn.execute(

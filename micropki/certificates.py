@@ -1,4 +1,4 @@
-"""
+"""l
 Генерация сертификатов X.509v3 для MicroPKI.
 
 Обрабатывает создание Корневого CA, Промежуточного CA
@@ -181,5 +181,5 @@ def build_end_entity_certificate(
 
 
 def certificate_to_pem(cert: x509.Certificate) -> bytes:
-    """Serialize an X.509 certificate to PEM format."""
+    """Сериализует сертификат X.509 в формат PEM."""
     return cert.public_bytes(serialization.Encoding.PEM)

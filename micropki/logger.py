@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 
 
 class _Iso8601Formatter(logging.Formatter):
-    """Custom formatter producing ISO 8601 timestamps with milliseconds."""
+    """Кастомный форматер, генерирующий временные метки ISO 8601 с миллисекундами."""
 
     def formatTime(self, record, datefmt=None):
         dt = datetime.fromtimestamp(record.created, tz=timezone.utc)
