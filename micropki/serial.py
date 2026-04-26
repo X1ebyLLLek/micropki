@@ -1,11 +1,11 @@
 """
-Unique serial number generator for MicroPKI.
+Генератор уникальных серийных номеров для MicroPKI.
 
-Generates 64-bit composite serial numbers:
-  - High 32 bits: Unix timestamp (seconds)
-  - Low 32 bits: CSPRNG random value
+Формирует 64-битные составные серийные номера:
+  - Старшие 32 бита: Unix-временная метка (секунды)
+  - Младшие 32 бита: случайное значение из CSPRNG
 
-Checks the database to guarantee uniqueness.
+Уникальность гарантируется проверкой по базе данных.
 """
 
 from __future__ import annotations
@@ -18,23 +18,22 @@ from .database import init_db, serial_exists
 
 def generate_unique_serial(db_path: str | None = None, max_retries: int = 10) -> int:
     """
-    Generate a unique 64-bit serial number.
+    Сгенерировать уникальный 64-битный серийный номер.
 
-    Composite format:
-      [32-bit timestamp][32-bit random]
+    Формат: [32 бита временной метки][32 бита случайных данных].
 
-    If db_path is provided, ensures the DB schema exists and checks
-    uniqueness against the database, retrying on collision.
+    Если передан db_path, инициализирует схему БД (идемпотентно) и проверяет
+    уникальность, повторяя попытку при коллизии.
 
-    Args:
-        db_path: Optional path to the SQLite database for uniqueness check.
-        max_retries: Maximum retry attempts if collision occurs.
+    Аргументы:
+        db_path: Необязательный путь к БД SQLite для проверки уникальности.
+        max_retries: Максимальное число попыток при коллизии.
 
-    Returns:
-        A positive 64-bit integer serial number.
+    Возвращает:
+        Положительное 64-битное целое — серийный номер.
 
-    Raises:
-        RuntimeError: If a unique serial cannot be generated after max_retries.
+    Вызывает исключения:
+        RuntimeError: Если уникальный номер не удалось получить за max_retries попыток.
     """
     if db_path is not None:
         init_db(db_path)  # Убедиться, что схема существует (идемпотентно)
@@ -55,6 +54,6 @@ def generate_unique_serial(db_path: str | None = None, max_retries: int = 10) ->
             return serial
 
     raise RuntimeError(
-        f"Failed to generate unique serial after {max_retries} attempts."
+        f"Не удалось сгенерировать уникальный серийный номер за {max_retries} попыток."
     )
 
