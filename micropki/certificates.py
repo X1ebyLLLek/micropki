@@ -24,6 +24,8 @@ from .crypto_utils import PrivateKey, get_signature_algorithm
 from .serial import generate_unique_serial
 from .templates import CertificateTemplate
 
+from cryptography.x509.oid import ExtendedKeyUsageOID
+
 
 def build_root_ca_certificate(
     private_key: PrivateKey,
@@ -175,6 +177,59 @@ def build_end_entity_certificate(
         builder = builder.add_extension(
             x509.SubjectAlternativeName(san_entries), critical=False,
         )
+
+    hash_algo = get_signature_algorithm(ca_key)
+    return builder.sign(private_key=ca_key, algorithm=hash_algo)
+
+
+def build_ocsp_signer_certificate(
+    subject: x509.Name,
+    public_key,
+    ca_key: PrivateKey,
+    ca_cert: x509.Certificate,
+    validity_days: int = 365,
+    db_path: str | None = None,
+) -> x509.Certificate:
+    """
+    Создаёт OCSP-сертификат подписи (EKU = OCSPSigning, KeyUsage = digitalSignature).
+
+    Включает расширение OCSPNoCheck (RFC 6960 §4.2.2.2.1), чтобы клиенты не
+    проверяли статус самого OCSP-сертификата через OCSP (бесконечная рекурсия).
+    """
+    now = datetime.now(tz=timezone.utc)
+    serial_number = generate_unique_serial(db_path)
+    ski = SubjectKeyIdentifier.from_public_key(public_key)
+    ca_ski = ca_cert.extensions.get_extension_for_class(SubjectKeyIdentifier)
+
+    builder = (
+        CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(ca_cert.subject)
+        .public_key(public_key)
+        .serial_number(serial_number)
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=validity_days))
+        .add_extension(BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=False,
+                key_encipherment=False, data_encipherment=False,
+                key_agreement=False, key_cert_sign=False, crl_sign=False,
+                encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.OCSP_SIGNING]),
+            critical=False,
+        )
+        .add_extension(ski, critical=False)
+        .add_extension(
+            AuthorityKeyIdentifier.from_issuer_subject_key_identifier(ca_ski.value),
+            critical=False,
+        )
+        .add_extension(x509.OCSPNoCheck(), critical=False)
+    )
 
     hash_algo = get_signature_algorithm(ca_key)
     return builder.sign(private_key=ca_key, algorithm=hash_algo)

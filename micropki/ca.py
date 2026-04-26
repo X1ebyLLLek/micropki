@@ -21,6 +21,7 @@ from cryptography.hazmat.primitives import serialization
 from .certificates import (
     build_end_entity_certificate,
     build_intermediate_ca_certificate,
+    build_ocsp_signer_certificate,
     build_root_ca_certificate,
     certificate_to_pem,
 )
@@ -307,6 +308,72 @@ def issue_cert(
     if san_strings:
         logger.info("SAN включены: %s", ", ".join(san_strings))
     logger.info("Выпуск сертификата конечного субъекта успешно завершен.")
+
+
+# ---- OCSP-сертификат ----
+
+def issue_ocsp_cert(
+    ca_cert_path: str,
+    ca_key_path: str,
+    ca_passphrase: bytes,
+    subject: str,
+    out_dir: str,
+    validity_days: int = 365,
+    db_path: str | None = None,
+) -> tuple[str, str]:
+    """
+    Выпустить OCSP-сертификат подписи (EKU = OCSPSigning), подписанный указанным CA.
+    Приватный ключ сохраняется незашифрованным.
+
+    Возвращает:
+        Кортеж (путь к сертификату, путь к ключу).
+    """
+    out_path = Path(out_dir)
+    certs_dir = out_path / "certs"
+    private_dir = out_path / "private"
+    certs_dir.mkdir(parents=True, exist_ok=True)
+    _create_private_dir(private_dir)
+
+    logger.info("Загрузка сертификата CA из: %s", ca_cert_path)
+    ca_cert = x509.load_pem_x509_certificate(Path(ca_cert_path).read_bytes())
+
+    logger.info("Загрузка приватного ключа CA.")
+    ca_key = load_encrypted_key(Path(ca_key_path).read_bytes(), ca_passphrase)
+
+    dn = parse_distinguished_name(subject)
+    logger.info("Генерация ключевой пары OCSP-респондера (RSA-2048).")
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+    ocsp_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    cert = build_ocsp_signer_certificate(
+        subject=dn,
+        public_key=ocsp_key.public_key(),
+        ca_key=ca_key,
+        ca_cert=ca_cert,
+        validity_days=validity_days,
+        db_path=db_path,
+    )
+    cert_pem = certificate_to_pem(cert)
+
+    _insert_cert_to_db(db_path, cert, cert_pem)
+
+    cert_file = certs_dir / "ocsp.cert.pem"
+    cert_file.write_bytes(cert_pem)
+    logger.info("OCSP-сертификат сохранён в: %s", cert_file.resolve())
+
+    key_pem = ocsp_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    key_file = private_dir / "ocsp.key.pem"
+    _write_key_file(key_file, key_pem)
+    logger.warning(
+        "OCSP приватный ключ сохранён НЕЗАШИФРОВАННЫМ в: %s. "
+        "Ограничьте доступ к файлу.", key_file.resolve(),
+    )
+    logger.info("Выпуск OCSP-сертификата завершён.")
+    return str(cert_file), str(key_file)
 
 
 # ---- Вспомогательные функции ----

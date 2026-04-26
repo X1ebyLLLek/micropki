@@ -23,7 +23,7 @@ import os
 import sys
 from pathlib import Path
 
-from .ca import init_ca, issue_cert, issue_intermediate
+from .ca import init_ca, issue_cert, issue_intermediate, issue_ocsp_cert
 from .database import get_by_serial, init_db, list_certificates
 from .logger import setup_logger
 from .repository import run_server
@@ -67,6 +67,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ca_show_cert_parser(ca_subparsers)
     _add_ca_revoke_parser(ca_subparsers)
     _add_ca_gen_crl_parser(ca_subparsers)
+    _add_ca_issue_ocsp_cert_parser(ca_subparsers)
 
     ca_parser.set_defaults(func=lambda args: (ca_parser.print_help(sys.stderr) or 1))
 
@@ -85,6 +86,14 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     _add_repo_serve_parser(repo_subparsers)
     repo_parser.set_defaults(func=lambda args: (repo_parser.print_help(sys.stderr) or 1))
+
+    # ---- Группа команд ocsp ----
+    ocsp_parser = subparsers.add_parser("ocsp", help="Операции OCSP-респондера")
+    ocsp_subparsers = ocsp_parser.add_subparsers(
+        title="подкоманды ocsp", dest="ocsp_command", help="Операции OCSP",
+    )
+    _add_ocsp_serve_parser(ocsp_subparsers)
+    ocsp_parser.set_defaults(func=lambda args: (ocsp_parser.print_help(sys.stderr) or 1))
 
     return parser
 
@@ -515,6 +524,93 @@ def _read_passphrase(passphrase_file: str, log) -> bytes:
 
     log.info("Файл с парольной фразой успешно прочитан (содержимое скрыто).")
     return passphrase
+
+
+def _add_ca_issue_ocsp_cert_parser(sub) -> None:
+    p = sub.add_parser("issue-ocsp-cert", help="Выпустить OCSP-сертификат подписи")
+    p.add_argument("--ca-cert", required=True, help="Путь к сертификату CA")
+    p.add_argument("--ca-key", required=True, help="Путь к приватному ключу CA")
+    p.add_argument("--ca-pass-file", required=True, help="Файл с парольной фразой CA")
+    p.add_argument("--subject", required=True, help="DN субъекта OCSP-респондера")
+    p.add_argument("--out-dir", default="./pki", help="Корневая папка PKI")
+    p.add_argument("--validity-days", type=int, default=365)
+    p.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_ca_issue_ocsp_cert)
+
+
+def _add_ocsp_serve_parser(sub) -> None:
+    p = sub.add_parser("serve", help="Запустить HTTP OCSP-респондер")
+    p.add_argument("--issuer-cert", required=True, help="Сертификат CA-издателя")
+    p.add_argument("--ocsp-cert", required=True, help="OCSP-сертификат подписи")
+    p.add_argument("--ocsp-key", required=True, help="Незашифрованный ключ OCSP")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=8081)
+    p.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_ocsp_serve)
+
+
+def _handle_ca_issue_ocsp_cert(args: argparse.Namespace) -> int:
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        _validate_subject(args.subject, log)
+        _validate_file_exists(args.ca_cert, "Сертификат CA")
+        _validate_file_exists(args.ca_key, "Приватный ключ CA")
+        ca_passphrase = _read_passphrase(args.ca_pass_file, log)
+        _validate_validity_days(args.validity_days, log)
+
+        cert_path, key_path = issue_ocsp_cert(
+            ca_cert_path=args.ca_cert,
+            ca_key_path=args.ca_key,
+            ca_passphrase=ca_passphrase,
+            subject=args.subject,
+            out_dir=args.out_dir,
+            validity_days=args.validity_days,
+            db_path=args.db_path,
+        )
+        print(f"OCSP-сертификат: {cert_path}")
+        print(f"OCSP-ключ:       {key_path}")
+        return 0
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Непредвиденная ошибка: %s", e)
+        return 1
+
+
+def _handle_ocsp_serve(args: argparse.Namespace) -> int:
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        from .ocsp_responder import run_ocsp_server
+        _validate_file_exists(args.issuer_cert, "Сертификат CA-издателя")
+        _validate_file_exists(args.ocsp_cert, "OCSP-сертификат")
+        _validate_file_exists(args.ocsp_key, "OCSP-ключ")
+
+        print(f"Запуск OCSP-респондера на http://{args.host}:{args.port}")
+        print("Нажмите Ctrl+C для остановки.")
+        run_ocsp_server(
+            host=args.host,
+            port=args.port,
+            issuer_cert_path=args.issuer_cert,
+            responder_cert_path=args.ocsp_cert,
+            responder_key_path=args.ocsp_key,
+            db_path=args.db_path,
+        )
+        return 0
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Ошибка OCSP-сервера: %s", e)
+        return 1
 
 
 def _validate_out_dir(out_dir: str) -> None:
