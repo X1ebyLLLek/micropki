@@ -9,6 +9,8 @@
   - ca show-cert            (Спринт 3)
   - db init                 (Спринт 3)
   - repo serve              (Спринт 3)
+  - ca revoke               (Спринт 4)
+  - ca gen-crl              (Спринт 4)
 """
 
 from __future__ import annotations
@@ -63,6 +65,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ca_issue_cert_parser(ca_subparsers)
     _add_ca_list_certs_parser(ca_subparsers)
     _add_ca_show_cert_parser(ca_subparsers)
+    _add_ca_revoke_parser(ca_subparsers)
+    _add_ca_gen_crl_parser(ca_subparsers)
 
     ca_parser.set_defaults(func=lambda args: (ca_parser.print_help(sys.stderr) or 1))
 
@@ -165,6 +169,41 @@ def _add_repo_serve_parser(sub) -> None:
     p.add_argument("--cert-dir", default="./pki/certs", help="Папка с сертификатами CA")
     p.add_argument("--log-file", default=None)
     p.set_defaults(func=_handle_repo_serve)
+
+
+def _add_ca_revoke_parser(sub) -> None:
+    p = sub.add_parser("revoke", help="Отозвать сертификат по серийному номеру")
+    p.add_argument("serial", help="Серийный номер сертификата (hex)")
+    p.add_argument(
+        "--reason",
+        default="unspecified",
+        choices=[
+            "unspecified", "keyCompromise", "cACompromise",
+            "affiliationChanged", "superseded", "cessationOfOperation",
+            "certificateHold", "removeFromCRL", "privilegeWithdrawn", "aACompromise",
+        ],
+        help="Причина отзыва по RFC 5280 (по умолчанию: unspecified)",
+    )
+    p.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    p.add_argument("--yes", action="store_true", default=False,
+                   help="Пропустить запрос подтверждения")
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_ca_revoke)
+
+
+def _add_ca_gen_crl_parser(sub) -> None:
+    p = sub.add_parser("gen-crl", help="Сгенерировать список отозванных сертификатов (CRL)")
+    p.add_argument("--ca", dest="ca_level", choices=["root", "intermediate"], required=True,
+                   help="Уровень CA, для которого генерируется CRL")
+    p.add_argument("--ca-cert", required=True, help="Путь к сертификату CA")
+    p.add_argument("--ca-key", required=True, help="Путь к приватному ключу CA")
+    p.add_argument("--ca-pass-file", required=True, help="Файл с парольной фразой CA")
+    p.add_argument("--out-dir", default="./pki", help="Корневая папка PKI")
+    p.add_argument("--validity-days", type=int, default=7,
+                   help="Срок действия CRL в днях (по умолчанию: 7)")
+    p.add_argument("--db-path", default=DEFAULT_DB_PATH)
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_ca_gen_crl)
 
 
 # ---- Обработчики ----
@@ -325,6 +364,64 @@ def _handle_repo_serve(args: argparse.Namespace) -> int:
     except Exception as e:
         print(f"Ошибка: {e}", file=sys.stderr)
         log.error("Ошибка сервера: %s", e)
+        return 1
+
+
+def _handle_ca_revoke(args: argparse.Namespace) -> int:
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        from .revocation import revoke_certificate
+
+        if not args.yes:
+            confirm = input(
+                f"Отозвать сертификат {args.serial} (причина: {args.reason})? [y/N] "
+            )
+            if confirm.strip().lower() not in ("y", "yes", "д", "да"):
+                print("Отмена.")
+                return 0
+
+        revoke_certificate(args.db_path, args.serial, reason=args.reason)
+        print(f"Сертификат {args.serial} успешно отозван (причина: {args.reason}).")
+        return 0
+    except ValueError as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Непредвиденная ошибка: %s", e)
+        return 1
+
+
+def _handle_ca_gen_crl(args: argparse.Namespace) -> int:
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        from .crl import generate_crl
+
+        _validate_file_exists(args.ca_cert, "Сертификат CA")
+        _validate_file_exists(args.ca_key, "Приватный ключ CA")
+        ca_passphrase = _read_passphrase(args.ca_pass_file, log)
+
+        crl_path = generate_crl(
+            ca_cert_path=args.ca_cert,
+            ca_key_path=args.ca_key,
+            ca_passphrase=ca_passphrase,
+            db_path=args.db_path,
+            out_dir=args.out_dir,
+            ca_level=args.ca_level,
+            validity_days=args.validity_days,
+        )
+        print(f"CRL успешно сгенерирован: {crl_path}")
+        return 0
+    except (ValueError, FileNotFoundError) as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Непредвиденная ошибка: %s", e)
         return 1
 
 

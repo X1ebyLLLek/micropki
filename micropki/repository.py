@@ -14,13 +14,13 @@ HTTP-сервер репозитория сертификатов для MicroPK
 
 from __future__ import annotations
 
-import json
 import logging
 import re
 from functools import partial
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlparse
 
 from .database import get_by_serial
 
@@ -50,14 +50,15 @@ class RepositoryHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Маршрутизация GET-запросов к соответствующим обработчикам."""
-        path = self.path.rstrip("/")
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/")
 
         if path.startswith("/certificate/"):
             self._handle_certificate(path[len("/certificate/"):])
         elif path.startswith("/ca/"):
             self._handle_ca(path[len("/ca/"):])
         elif path == "/crl":
-            self._handle_crl()
+            self._handle_crl(parsed.query)
         else:
             self._send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
@@ -114,12 +115,35 @@ class RepositoryHandler(BaseHTTPRequestHandler):
         pem_data = cert_path.read_text(encoding="utf-8")
         self._send_pem(pem_data)
 
-    def _handle_crl(self) -> None:
-        """GET /crl — заглушка для Спринта 4."""
-        self._send_error(
-            HTTPStatus.NOT_IMPLEMENTED,
-            "Генерация CRL пока не реализована.",
-        )
+    def _handle_crl(self, query_string: str = "") -> None:
+        """GET /crl[?ca=root|intermediate] — отдача файла CRL."""
+        params = parse_qs(query_string)
+        ca_level = params.get("ca", ["intermediate"])[0].lower()
+
+        if ca_level not in ("root", "intermediate"):
+            self._send_error(
+                HTTPStatus.BAD_REQUEST,
+                f"Неверный параметр ca='{ca_level}'. Используйте 'root' или 'intermediate'.",
+            )
+            return
+
+        crl_file = self.cert_dir.parent / "crl" / f"{ca_level}.crl.pem"
+        if not crl_file.exists():
+            self._send_error(
+                HTTPStatus.NOT_FOUND,
+                f"CRL для '{ca_level}' ещё не сгенерирован. "
+                f"Запустите: micropki ca gen-crl --ca {ca_level}",
+            )
+            return
+
+        crl_data = crl_file.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/pkix-crl")
+        self.send_header("Content-Length", str(len(crl_data)))
+        self.send_header("Cache-Control", "max-age=3600")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
+        self.wfile.write(crl_data)
 
     def _send_pem(self, pem_text: str) -> None:
         """Отправка ответа в формате PEM с правильными заголовками."""

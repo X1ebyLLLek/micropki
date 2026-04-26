@@ -378,14 +378,15 @@ class TestHTTPRepository:
         resp = urllib.request.urlopen(url)
         assert resp.status == 200
 
-    def test_crl_returns_501(self, server_with_data):
+    def test_crl_без_файла_возвращает_ошибку(self, server_with_data):
+        # В спринте 4 /crl реализован: возвращает 404 если CRL ещё не сгенерирован
         port, _, _ = server_with_data
         url = f"http://127.0.0.1:{port}/crl"
         try:
             urllib.request.urlopen(url)
             assert False, "Should have raised"
         except urllib.error.HTTPError as e:
-            assert e.code == 501
+            assert e.code in (404, 501)
 
     def test_invalid_serial_returns_400(self, server_with_data):
         port, _, _ = server_with_data
