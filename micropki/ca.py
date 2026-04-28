@@ -32,7 +32,7 @@ from .crypto_utils import (
     load_encrypted_key,
     parse_distinguished_name,
 )
-from .csr import csr_to_pem, generate_csr
+from .csr import csr_to_pem, generate_csr, load_csr_from_pem
 from .database import insert_certificate
 from .templates import (
     CertificateTemplate,
@@ -224,52 +224,142 @@ def issue_intermediate(
 
 # ---- Конечный сертификат ----
 
+def sign_csr_request(
+    csr_pem: bytes,
+    template_name: str,
+    ca_cert: x509.Certificate,
+    ca_key,
+    validity_days: int = 365,
+    db_path: str | None = None,
+) -> bytes:
+    """
+    Подписывает CSR ключом CA и возвращает PEM сертификата (без записи файлов).
+    Используется репозиторием для обработки POST /request-cert.
+
+    Вызывает ValueError при невалидном CSR или запросе CA=True.
+    """
+    csr = load_csr_from_pem(csr_pem)
+
+    # Конечный сертификат не должен запрашивать роль CA
+    try:
+        bc = csr.extensions.get_extension_for_class(x509.BasicConstraints)
+        if bc.value.ca:
+            raise ValueError("CSR не должен запрашивать CA=True для конечного сертификата")
+    except x509.ExtensionNotFound:
+        pass
+
+    template = get_template(template_name)
+    dn = csr.subject
+
+    san_entries = []
+    try:
+        san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        san_entries = list(san_ext.value)
+    except x509.ExtensionNotFound:
+        pass
+
+    validate_sans_for_template(template, san_entries)
+
+    cert = build_end_entity_certificate(
+        subject=dn,
+        public_key=csr.public_key(),
+        ca_key=ca_key,
+        ca_cert=ca_cert,
+        template=template,
+        san_entries=san_entries if san_entries else None,
+        validity_days=validity_days,
+        db_path=db_path,
+    )
+    cert_pem = certificate_to_pem(cert)
+    _insert_cert_to_db(db_path, cert, cert_pem)
+
+    logger.info(
+        "CSR подписан (API): serial=0x%s, subject=%s, template=%s",
+        format(cert.serial_number, "X"),
+        cert.subject.rfc4514_string(),
+        template.name,
+    )
+    return cert_pem
+
+
 def issue_cert(
     ca_cert_path: str,
     ca_key_path: str,
     ca_passphrase: bytes,
     template_name: str,
-    subject: str,
+    subject: str | None,
     san_strings: list[str] | None,
     out_dir: str,
     validity_days: int = 365,
     db_path: str | None = None,
-) -> None:
+    csr_pem: bytes | None = None,
+) -> bytes:
     """
     Выпустить конечный сертификат (end-entity) используя шаблон.
+    Если csr_pem передан — публичный ключ, subject и SAN берутся из CSR.
     Автоматически сохраняется в базу данных.
+
+    Возвращает PEM сертификата в виде байт.
     """
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
     logger.info("Загрузка сертификата CA из: %s", ca_cert_path)
-    ca_cert_pem = Path(ca_cert_path).read_bytes()
-    ca_cert = x509.load_pem_x509_certificate(ca_cert_pem)
+    ca_cert = x509.load_pem_x509_certificate(Path(ca_cert_path).read_bytes())
 
     logger.info("Загрузка приватного ключа CA (содержимое скрыто).")
-    ca_key_pem = Path(ca_key_path).read_bytes()
-    ca_key = load_encrypted_key(ca_key_pem, ca_passphrase)
+    ca_key = load_encrypted_key(Path(ca_key_path).read_bytes(), ca_passphrase)
 
     template = get_template(template_name)
     logger.info("Используется шаблон сертификата: %s", template.name)
 
-    logger.info("Парсинг subject DN сертификата: %s", subject)
-    dn = parse_distinguished_name(subject)
+    if csr_pem is not None:
+        # --- Путь через CSR ---
+        csr = load_csr_from_pem(csr_pem)
 
-    san_entries = []
-    if san_strings:
-        san_entries = parse_san_entries(san_strings)
-        logger.info("Распарсено %d SAN записей: %s", len(san_entries), ", ".join(san_strings))
+        try:
+            bc = csr.extensions.get_extension_for_class(x509.BasicConstraints)
+            if bc.value.ca:
+                raise ValueError("CSR не должен запрашивать CA=True для конечного сертификата")
+        except x509.ExtensionNotFound:
+            pass
+
+        dn = csr.subject
+        ee_public_key = csr.public_key()
+        logger.info("CSR: публичный ключ и subject извлечены из CSR.")
+
+        san_entries = []
+        try:
+            san_ext = csr.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+            san_entries = list(san_ext.value)
+            logger.info("CSR: извлечено %d SAN записей.", len(san_entries))
+        except x509.ExtensionNotFound:
+            if san_strings:
+                san_entries = parse_san_entries(san_strings)
+                logger.info("CSR не содержит SAN, использованы --san аргументы.")
+        save_key = False
+    else:
+        # --- Генерация новой ключевой пары ---
+        logger.info("Парсинг subject DN сертификата: %s", subject)
+        dn = parse_distinguished_name(subject)  # type: ignore[arg-type]
+
+        san_entries = []
+        if san_strings:
+            san_entries = parse_san_entries(san_strings)
+            logger.info("Распарсено %d SAN записей: %s", len(san_entries), ", ".join(san_strings))
+
+        logger.info("Генерация ключевой пары конечного субъекта (RSA-2048).")
+        from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+        ee_key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        ee_public_key = ee_key.public_key()
+        logger.info("Генерация ключа конечного субъекта завершена.")
+        save_key = True
+
     validate_sans_for_template(template, san_entries)
-
-    logger.info("Генерация ключевой пары конечного субъекта (RSA-2048).")
-    from cryptography.hazmat.primitives.asymmetric import rsa
-    ee_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    logger.info("Генерация ключа конечного субъекта завершена.")
 
     logger.info("Построение сертификата %s.", template.name)
     cert = build_end_entity_certificate(
-        subject=dn, public_key=ee_key.public_key(), ca_key=ca_key,
+        subject=dn, public_key=ee_public_key, ca_key=ca_key,
         ca_cert=ca_cert, template=template,
         san_entries=san_entries if san_entries else None,
         validity_days=validity_days, db_path=db_path,
@@ -282,8 +372,6 @@ def issue_cert(
     )
 
     cert_pem = certificate_to_pem(cert)
-
-    # Вставляем в БД перед записью файлов
     _insert_cert_to_db(db_path, cert, cert_pem)
 
     cn_attrs = dn.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
@@ -293,21 +381,21 @@ def issue_cert(
     cert_file.write_bytes(cert_pem)
     logger.info("Сертификат сохранен в: %s", cert_file.resolve())
 
-    key_file = out_path / f"{base_name}.key.pem"
-    unencrypted_pem = ee_key.private_bytes(
-        encoding=serialization.Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    _write_key_file(key_file, unencrypted_pem)
-    logger.warning(
-        "Приватный ключ конечного субъекта сохранён НЕЗАШИФРОВАННЫМ в: %s. "
-        "Пожалуйста, обеспечьте его безопасность должным образом.", key_file.resolve(),
-    )
+    if save_key:
+        key_file = out_path / f"{base_name}.key.pem"
+        unencrypted_pem = ee_key.private_bytes(  # type: ignore[possibly-undefined]
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        _write_key_file(key_file, unencrypted_pem)
+        logger.warning(
+            "Приватный ключ конечного субъекта сохранён НЕЗАШИФРОВАННЫМ в: %s. "
+            "Пожалуйста, обеспечьте его безопасность должным образом.", key_file.resolve(),
+        )
 
-    if san_strings:
-        logger.info("SAN включены: %s", ", ".join(san_strings))
     logger.info("Выпуск сертификата конечного субъекта успешно завершен.")
+    return cert_pem
 
 
 # ---- OCSP-сертификат ----
