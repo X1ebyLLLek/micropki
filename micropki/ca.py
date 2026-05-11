@@ -3,6 +3,8 @@
 
 Оркестрирует инициализацию Корневого CA, выпуск Промежуточного CA
 и конечных сертификатов с интеграцией с базой данных.
+
+Sprint 7: добавлены проверки политик (policy.py) и аудит (audit.py).
 """
 
 from __future__ import annotations
@@ -40,10 +42,24 @@ from .templates import (
     parse_san_entries,
     validate_sans_for_template,
 )
+from .policy import (
+    check_key_size,
+    check_validity_days,
+    check_san_policy,
+)
 
 logger = logging.getLogger("micropki")
 
 DEFAULT_DB_PATH = "./pki/micropki.db"
+DEFAULT_AUDIT_DIR = "./pki/audit"
+
+
+def _get_audit_logger(audit_dir: str | None) -> "AuditLogger | None":  # type: ignore[name-defined]
+    """Создаёт AuditLogger если задан audit_dir, иначе None."""
+    if not audit_dir:
+        return None
+    from .audit import AuditLogger
+    return AuditLogger(Path(audit_dir) / "audit.log")
 
 
 def _insert_cert_to_db(db_path: str | None, cert: x509.Certificate, cert_pem: bytes) -> None:
@@ -81,6 +97,7 @@ def init_ca(
     validity_days: int,
     force: bool = False,
     db_path: str | None = None,
+    audit_dir: str | None = None,
 ) -> None:
     """
     Инициализировать самоподписанный Корневой CA.
@@ -88,7 +105,10 @@ def init_ca(
     Создает структуру папок, генерирует пару ключей, создает самоподписанный
     сертификат, шифрует и сохраняет приватный ключ и генерирует policy.txt.
     Опционально вставляет сертификат в базу данных.
+
+    Sprint 7: проверяет политику (размер ключа, срок действия), ведёт аудит.
     """
+    audit = _get_audit_logger(audit_dir)
     out_path = Path(out_dir)
     private_dir = out_path / "private"
     certs_dir = out_path / "certs"
@@ -102,6 +122,14 @@ def init_ca(
                     f"Файл '{f}' уже существует. Используйте --force для перезаписи."
                 )
 
+    # Проверка политики: срок действия корневого CA
+    try:
+        check_validity_days(validity_days, "root")
+    except ValueError as e:
+        if audit:
+            audit.log("ca_init", "failure", str(e), metadata={"subject": subject, "role": "root"})
+        raise
+
     out_path.mkdir(parents=True, exist_ok=True)
     certs_dir.mkdir(parents=True, exist_ok=True)
     _create_private_dir(private_dir)
@@ -112,6 +140,14 @@ def init_ca(
     logger.info("Начало генерации ключа: type=%s, size=%s", key_type, key_size)
     private_key = generate_key(key_type, key_size)
     logger.info("Генерация ключа успешно завершена.")
+
+    # Проверка политики: размер ключа для корневого CA
+    try:
+        check_key_size(private_key.public_key(), "root")
+    except ValueError as e:
+        if audit:
+            audit.log("ca_init", "failure", str(e), metadata={"subject": subject, "role": "root"})
+        raise
 
     logger.info("Начало подписи сертификата (самоподписанный Корневой CA).")
     certificate = build_root_ca_certificate(private_key, dn, validity_days, db_path=db_path)
@@ -133,6 +169,18 @@ def init_ca(
     policy_file = out_path / "policy.txt"
     _generate_policy_root(policy_file, certificate, key_type, key_size)
     logger.info("Сгенерирован документ политики: %s", policy_file.resolve())
+
+    if audit:
+        audit.log(
+            "ca_init", "success",
+            f"Инициализирован корневой CA: {subject}",
+            metadata={
+                "subject": subject,
+                "serial": format(certificate.serial_number, "X"),
+                "validity_days": validity_days,
+                "key_type": key_type,
+            },
+        )
     logger.info("Инициализация Корневого CA успешно завершена.")
 
 
@@ -150,15 +198,29 @@ def issue_intermediate(
     validity_days: int,
     path_length: int = 0,
     db_path: str | None = None,
+    audit_dir: str | None = None,
 ) -> None:
     """
     Выпустить сертификат Промежуточного CA, подписанный Корневым CA.
     Автоматически сохраняется в базу данных.
+
+    Sprint 7: проверяет политику (размер ключа, срок, pathLen), ведёт аудит.
     """
+    audit = _get_audit_logger(audit_dir)
     out_path = Path(out_dir)
     private_dir = out_path / "private"
     certs_dir = out_path / "certs"
     csrs_dir = out_path / "csrs"
+
+    # Проверка политики: срок действия промежуточного CA
+    try:
+        check_validity_days(validity_days, "intermediate")
+        from .policy import check_path_length
+        check_path_length(path_length, "intermediate")
+    except ValueError as e:
+        if audit:
+            audit.log("issue_intermediate", "failure", str(e), metadata={"subject": subject})
+        raise
 
     out_path.mkdir(parents=True, exist_ok=True)
     certs_dir.mkdir(parents=True, exist_ok=True)
@@ -179,6 +241,14 @@ def issue_intermediate(
     logger.info("Начало генерации ключа Промежуточного CA: type=%s, size=%s", key_type, key_size)
     intermediate_key = generate_key(key_type, key_size)
     logger.info("Генерация ключа Промежуточного CA завершена.")
+
+    # Проверка политики: размер ключа для промежуточного CA
+    try:
+        check_key_size(intermediate_key.public_key(), "intermediate")
+    except ValueError as e:
+        if audit:
+            audit.log("issue_intermediate", "failure", str(e), metadata={"subject": subject})
+        raise
 
     logger.info("Генерация CSR Промежуточного CA.")
     csr = generate_csr(intermediate_key, dn, is_ca=True, path_length=path_length)
@@ -219,6 +289,17 @@ def issue_intermediate(
         policy_file, intermediate_cert, root_cert, key_type, key_size, path_length
     )
     logger.info("Документ политики обновлен информацией о Промежуточном CA.")
+
+    if audit:
+        audit.log(
+            "issue_intermediate", "success",
+            f"Выпущен промежуточный CA: {subject}",
+            metadata={
+                "subject": subject,
+                "serial": format(intermediate_cert.serial_number, "X"),
+                "validity_days": validity_days,
+            },
+        )
     logger.info("Выпуск Промежуточного CA успешно завершен.")
 
 
@@ -293,16 +374,33 @@ def issue_cert(
     validity_days: int = 365,
     db_path: str | None = None,
     csr_pem: bytes | None = None,
+    audit_dir: str | None = None,
+    allow_wildcards: bool = False,
 ) -> bytes:
     """
     Выпустить конечный сертификат (end-entity) используя шаблон.
     Если csr_pem передан — публичный ключ, subject и SAN берутся из CSR.
     Автоматически сохраняется в базу данных.
 
+    Sprint 7: проверяет политику (размер ключа, срок, SAN, скомпрометированные ключи),
+    записывает в аудит и CT-лог.
+
     Возвращает PEM сертификата в виде байт.
     """
+    audit = _get_audit_logger(audit_dir)
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
+
+    # Проверка политики: срок действия конечного сертификата
+    try:
+        check_validity_days(validity_days, "end_entity")
+    except ValueError as e:
+        if audit:
+            audit.log(
+                "issue_certificate", "failure", str(e),
+                metadata={"template": template_name, "subject": subject or ""},
+            )
+        raise
 
     logger.info("Загрузка сертификата CA из: %s", ca_cert_path)
     ca_cert = x509.load_pem_x509_certificate(Path(ca_cert_path).read_bytes())
@@ -355,6 +453,31 @@ def issue_cert(
         logger.info("Генерация ключа конечного субъекта завершена.")
         save_key = True
 
+    # Проверка политики: размер ключа, SAN, скомпрометированный ключ
+    _subject_str = subject or (dn.rfc4514_string() if dn else "")
+    try:
+        check_key_size(ee_public_key, "end_entity")
+        check_san_policy(san_entries, template_name, allow_wildcards=allow_wildcards)
+    except ValueError as e:
+        if audit:
+            audit.log(
+                "issue_certificate", "failure", str(e),
+                metadata={"template": template_name, "subject": _subject_str},
+            )
+        raise
+
+    if db_path:
+        from .compromise import hash_public_key, is_key_compromised
+        pub_hash = hash_public_key(ee_public_key)
+        if is_key_compromised(db_path, pub_hash):
+            msg = "Выпуск отклонён: публичный ключ скомпрометирован."
+            if audit:
+                audit.log(
+                    "issue_certificate", "failure", msg,
+                    metadata={"template": template_name, "subject": _subject_str, "key_hash": pub_hash},
+                )
+            raise ValueError(msg)
+
     validate_sans_for_template(template, san_entries)
 
     logger.info("Построение сертификата %s.", template.name)
@@ -373,6 +496,21 @@ def issue_cert(
 
     cert_pem = certificate_to_pem(cert)
     _insert_cert_to_db(db_path, cert, cert_pem)
+
+    # Запись в CT-лог и аудит
+    if audit_dir:
+        from .transparency import CTLog
+        CTLog(audit_dir).append(cert)
+        audit.log(  # type: ignore[union-attr]
+            "issue_certificate", "success",
+            f"Выпущен сертификат {template_name}: {cert.subject.rfc4514_string()}",
+            metadata={
+                "serial": format(cert.serial_number, "X"),
+                "subject": cert.subject.rfc4514_string(),
+                "template": template_name,
+                "validity_days": validity_days,
+            },
+        )
 
     cn_attrs = dn.get_attributes_for_oid(x509.oid.NameOID.COMMON_NAME)
     base_name = _sanitize_filename(cn_attrs[0].value) if cn_attrs else format(cert.serial_number, "x")
@@ -399,6 +537,84 @@ def issue_cert(
 
 
 # ---- OCSP-сертификат ----
+
+def compromise_cert(
+    cert_path: str,
+    db_path: str,
+    reason: str = "keyCompromise",
+    audit_dir: str | None = None,
+    ca_cert_path: str | None = None,
+    ca_key_path: str | None = None,
+    ca_passphrase: bytes | None = None,
+    out_dir: str | None = None,
+) -> dict:
+    """
+    Симуляция компрометации приватного ключа (CLI-33 / CTL-3).
+
+    Выполняет:
+      1. Загружает сертификат из файла.
+      2. Записывает публичный ключ в compromised_keys.
+      3. Отзывает сертификат в БД (reason=keyCompromise).
+      4. Опционально генерирует новый CRL (emergency update).
+      5. Записывает HIGH-severity запись в аудит.
+
+    Возвращает словарь с результатом операции.
+    """
+    from .compromise import simulate_compromise
+    from .database import get_by_serial
+
+    audit = _get_audit_logger(audit_dir)
+
+    cert = x509.load_pem_x509_certificate(Path(cert_path).read_bytes())
+    serial_hex = format(cert.serial_number, "X")
+    subject_str = cert.subject.rfc4514_string()
+
+    pub_hash = simulate_compromise(db_path, cert, reason)
+
+    # Опциональная аварийная генерация CRL
+    crl_path = None
+    if ca_cert_path and ca_key_path and ca_passphrase and out_dir:
+        try:
+            from .crl import generate_crl
+            from .database import get_revoked as _get_revoked
+            ca_cert = x509.load_pem_x509_certificate(Path(ca_cert_path).read_bytes())
+            ca_key = load_encrypted_key(Path(ca_key_path).read_bytes(), ca_passphrase)
+            revoked = _get_revoked(db_path)
+            crl_pem = generate_crl(ca_key, ca_cert, revoked)
+            crl_file = Path(out_dir) / "crl" / "ca.crl.pem"
+            crl_file.parent.mkdir(parents=True, exist_ok=True)
+            crl_file.write_bytes(crl_pem)
+            crl_path = str(crl_file)
+            logger.info("Аварийный CRL сгенерирован: %s", crl_path)
+        except Exception as exc:
+            logger.error("Не удалось сгенерировать аварийный CRL: %s", exc)
+
+    if audit:
+        audit.log(
+            "key_compromise", "success",
+            f"[HIGH] Компрометация ключа: serial={serial_hex}, subject={subject_str}",
+            level="AUDIT",
+            metadata={
+                "serial": serial_hex,
+                "subject": subject_str,
+                "reason": reason,
+                "public_key_hash": pub_hash,
+                "crl_updated": crl_path is not None,
+            },
+        )
+
+    logger.warning(
+        "КОМПРОМЕТАЦИЯ КЛЮЧА: serial=%s, subject=%s, reason=%s",
+        serial_hex, subject_str, reason,
+    )
+    return {
+        "serial": serial_hex,
+        "subject": subject_str,
+        "public_key_hash": pub_hash,
+        "reason": reason,
+        "crl_path": crl_path,
+    }
+
 
 def issue_ocsp_cert(
     ca_cert_path: str,

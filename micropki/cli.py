@@ -29,7 +29,7 @@ import os
 import sys
 from pathlib import Path
 
-from .ca import init_ca, issue_cert, issue_intermediate, issue_ocsp_cert
+from .ca import compromise_cert, init_ca, issue_cert, issue_intermediate, issue_ocsp_cert
 from .database import get_by_serial, init_db, list_certificates
 from .logger import setup_logger
 from .repository import run_server
@@ -73,6 +73,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_ca_revoke_parser(ca_subparsers)
     _add_ca_gen_crl_parser(ca_subparsers)
     _add_ca_issue_ocsp_cert_parser(ca_subparsers)
+    _add_ca_compromise_parser(ca_subparsers)
     ca_parser.set_defaults(func=lambda args: (ca_parser.print_help(sys.stderr) or 1))
 
     # ---- db ----
@@ -109,6 +110,15 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_validate_parser(client_subparsers)
     _add_client_check_status_parser(client_subparsers)
     client_parser.set_defaults(func=lambda args: (client_parser.print_help(sys.stderr) or 1))
+
+    # ---- audit (Sprint 7) ----
+    audit_parser = subparsers.add_parser("audit", help="Управление журналом аудита (Спринт 7)")
+    audit_subparsers = audit_parser.add_subparsers(
+        title="подкоманды audit", dest="audit_command", help="Операции аудита",
+    )
+    _add_audit_query_parser(audit_subparsers)
+    _add_audit_verify_parser(audit_subparsers)
+    audit_parser.set_defaults(func=lambda args: (audit_parser.print_help(sys.stderr) or 1))
 
     return parser
 
@@ -850,3 +860,187 @@ def _validate_out_dir(out_dir: str) -> None:
             raise ValueError(f"Выходной путь не является папкой: '{out_dir}'")
         if not os.access(str(path), os.W_OK):
             raise ValueError(f"Выходная папка недоступна для записи: '{out_dir}'")
+
+
+# ============================================================
+#  Sprint 7: ca compromise
+# ============================================================
+
+def _add_ca_compromise_parser(sub) -> None:
+    """Субкоманда: micropki ca compromise (CLI-33)."""
+    p = sub.add_parser("compromise", help="Симуляция компрометации приватного ключа (Спринт 7)")
+    p.add_argument("--cert", required=True, help="Путь к сертификату, ключ которого скомпрометирован")
+    p.add_argument("--db", default=DEFAULT_DB_PATH, help="Путь к базе данных SQLite")
+    p.add_argument("--reason", default="keyCompromise", help="Причина компрометации")
+    p.add_argument("--audit-dir", default=None, help="Директория для журнала аудита")
+    p.add_argument("--ca-cert", default=None, help="Сертификат CA для аварийного обновления CRL")
+    p.add_argument("--ca-key", default=None, help="Ключ CA для аварийного обновления CRL")
+    p.add_argument("--passphrase-file", default=None, help="Файл с парольной фразой для ключа CA")
+    p.add_argument("--out-dir", default=None, help="Директория для сохранения нового CRL")
+    p.add_argument("--force", action="store_true", help="Пропустить подтверждение")
+    p.set_defaults(func=_cmd_ca_compromise)
+
+
+def _cmd_ca_compromise(args) -> int:
+    log = setup_logger(getattr(args, "verbose", False))
+    try:
+        _validate_file_exists(args.cert, "Сертификат")
+
+        if not args.force:
+            print(
+                f"Симуляция компрометации ключа для: {args.cert}\n"
+                f"Причина: {args.reason}\n"
+                "Подтвердите (yes/no): ",
+                end="",
+                flush=True,
+            )
+            answer = input().strip().lower()
+            if answer not in ("yes", "y", "да"):
+                print("Операция отменена.")
+                return 1
+
+        passphrase = None
+        if args.passphrase_file:
+            passphrase = _read_passphrase(args.passphrase_file, log)
+
+        result = compromise_cert(
+            cert_path=args.cert,
+            db_path=args.db,
+            reason=args.reason,
+            audit_dir=args.audit_dir,
+            ca_cert_path=args.ca_cert,
+            ca_key_path=args.ca_key,
+            ca_passphrase=passphrase,
+            out_dir=args.out_dir,
+        )
+
+        print(f"[OK] Сертификат скомпрометирован и отозван.")
+        print(f"     Serial:   {result['serial']}")
+        print(f"     Subject:  {result['subject']}")
+        print(f"     KeyHash:  {result['public_key_hash'][:32]}...")
+        if result["crl_path"]:
+            print(f"     CRL:      {result['crl_path']}")
+        return 0
+
+    except Exception as exc:
+        log.error("Ошибка компрометации: %s", exc)
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+
+
+# ============================================================
+#  Sprint 7: audit query / audit verify
+# ============================================================
+
+_DEFAULT_AUDIT_LOG = "./pki/audit/audit.log"
+
+
+def _add_audit_query_parser(sub) -> None:
+    """Субкоманда: micropki audit query (CLI-31)."""
+    p = sub.add_parser("query", help="Поиск и фильтрация записей журнала аудита")
+    p.add_argument("--log-file", default=_DEFAULT_AUDIT_LOG, help="Путь к файлу журнала")
+    p.add_argument("--from", dest="from_ts", default=None, help="Начало периода (ISO 8601)")
+    p.add_argument("--to", dest="to_ts", default=None, help="Конец периода (ISO 8601)")
+    p.add_argument("--level", default=None, help="Уровень (INFO, WARNING, ERROR, AUDIT)")
+    p.add_argument("--operation", default=None, help="Тип операции (issue, revoke, ca_init...)")
+    p.add_argument("--serial", default=None, help="Серийный номер сертификата")
+    p.add_argument(
+        "--format", dest="output_format", default="table",
+        choices=["table", "json", "csv"],
+        help="Формат вывода",
+    )
+    p.add_argument(
+        "--verify", action="store_true",
+        help="Проверить целостность хеш-цепочки найденных записей",
+    )
+    p.set_defaults(func=_cmd_audit_query)
+
+
+def _cmd_audit_query(args) -> int:
+    log = setup_logger(getattr(args, "verbose", False))
+    try:
+        from .audit import AuditLogger
+        al = AuditLogger(args.log_file)
+        entries = al.query(
+            from_ts=args.from_ts,
+            to_ts=args.to_ts,
+            level=args.level,
+            operation=args.operation,
+            serial=args.serial,
+        )
+
+        if args.verify:
+            ok, msg = al.verify()
+            status_str = "OK" if ok else "ОШИБКА ЦЕЛОСТНОСТИ"
+            print(f"[Проверка целостности: {status_str}] {msg}\n")
+            if not ok:
+                return 2
+
+        if not entries:
+            print("Записи не найдены.")
+            return 0
+
+        if args.output_format == "json":
+            print(json.dumps(entries, ensure_ascii=False, indent=2))
+
+        elif args.output_format == "csv":
+            out = io.StringIO()
+            writer = csv.DictWriter(
+                out,
+                fieldnames=["timestamp", "level", "operation", "status", "message"],
+                extrasaction="ignore",
+            )
+            writer.writeheader()
+            writer.writerows(entries)
+            print(out.getvalue(), end="")
+
+        else:
+            # Табличный вывод
+            fmt = "{:<27} {:<8} {:<22} {:<8} {}"
+            print(fmt.format("Время", "Уровень", "Операция", "Статус", "Сообщение"))
+            print("-" * 90)
+            for e in entries:
+                print(fmt.format(
+                    e.get("timestamp", "")[:26],
+                    e.get("level", ""),
+                    e.get("operation", "")[:22],
+                    e.get("status", ""),
+                    e.get("message", "")[:50],
+                ))
+            print(f"\nНайдено записей: {len(entries)}")
+
+        return 0
+
+    except Exception as exc:
+        log.error("Ошибка audit query: %s", exc)
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1
+
+
+def _add_audit_verify_parser(sub) -> None:
+    """Субкоманда: micropki audit verify (CLI-32)."""
+    p = sub.add_parser("verify", help="Проверка целостности всего журнала аудита")
+    p.add_argument(
+        "--log-file", default=_DEFAULT_AUDIT_LOG,
+        help="Путь к файлу журнала аудита",
+    )
+    p.add_argument(
+        "--chain-file", default=None,
+        help="Путь к файлу chain.dat (по умолчанию рядом с лог-файлом)",
+    )
+    p.set_defaults(func=_cmd_audit_verify)
+
+
+def _cmd_audit_verify(args) -> int:
+    log = setup_logger(getattr(args, "verbose", False))
+    try:
+        from .audit import verify_log_file
+        ok, msg = verify_log_file(args.log_file, args.chain_file)
+        status = "OK" if ok else "НАРУШЕНИЕ ЦЕЛОСТНОСТИ"
+        print(f"[{status}] {msg}")
+        return 0 if ok else 2
+
+    except Exception as exc:
+        log.error("Ошибка audit verify: %s", exc)
+        print(f"Ошибка: {exc}", file=sys.stderr)
+        return 1

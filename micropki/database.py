@@ -3,6 +3,8 @@
 
 Хранит информацию о выпущенных сертификатах (серийный номер, субъект, даты,
 статус отзыва) и сам файл PEM для быстрого извлечения репозиторием.
+
+Sprint 7: добавлена таблица compromised_keys (DB-10).
 """
 
 from __future__ import annotations
@@ -36,6 +38,17 @@ CREATE TABLE IF NOT EXISTS certificates (
 
 CREATE INDEX IF NOT EXISTS idx_serial_hex ON certificates (serial_hex);
 CREATE INDEX IF NOT EXISTS idx_status ON certificates (status);
+
+CREATE TABLE IF NOT EXISTS compromised_keys (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    public_key_hash TEXT UNIQUE NOT NULL,
+    certificate_serial TEXT NOT NULL,
+    compromise_date TEXT NOT NULL,
+    compromise_reason TEXT NOT NULL,
+    FOREIGN KEY (certificate_serial) REFERENCES certificates(serial_hex)
+);
+
+CREATE INDEX IF NOT EXISTS idx_compromised_hash ON compromised_keys (public_key_hash);
 """
 
 
