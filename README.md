@@ -281,3 +281,175 @@ micropki repo serve --host 0.0.0.0 --port 8080 --rate-limit 5 --rate-burst 10
 
 При превышении лимита сервер отвечает `HTTP 429 Too Many Requests`
 с заголовком `Retry-After: N`.
+
+---
+
+## CI Badge
+
+![CI](https://github.com/X1ebyLLLek/micropki/workflows/CI/badge.svg)
+
+Coverage: see CI
+
+---
+
+## Sprint 8: Demo Walkthrough
+
+### Запуск автоматизированного демо
+
+```bash
+# Через CLI-команду
+python -m micropki demo run
+
+# Напрямую
+python demo/demo.py
+```
+
+Скрипт `demo/demo.py` запускает полный PKI-сценарий во временной директории:
+
+1. Инициализация Root CA (RSA-4096, самоподписанный)
+2. Выпуск Intermediate CA (RSA-4096, pathlen=0)
+3. Выпуск server-сертификата (SAN: dns:demo.local, ip:127.0.0.1)
+4. Выпуск client-сертификата
+5. Выпуск OCSP responder-сертификата
+6. Выпуск code-signing сертификата
+7. Валидация server-сертификата через цепочку
+8. Генерация CRL и проверка статуса
+9. Отзыв server-сертификата
+10. Проверка что отозванный сертификат зафиксирован в БД как `revoked`
+11. Проверка целостности аудит-лога (SHA-256 хеш-цепочка)
+12. Проверка политики (RSA-2048 для CA отвергается)
+13. TLS демо: Python HTTPS-сервер + TLS-клиент с нашим Root CA как доверенным
+14. Code signing: подпись файла приватным ключом + верификация через сертификат
+15. Итоговая статистика с цветным выводом `[PASS]` / `[FAIL]`
+
+Для каждого шага выводится цветная метка — зелёная `[PASS]` или красная `[FAIL]`.
+Скрипт идемпотентен: использует `tempfile.mkdtemp()`, каждый запуск — чистое окружение.
+
+---
+
+## TLS Integration
+
+Запуск встроенного Python HTTPS-сервера с сертификатом MicroPKI:
+
+```bash
+# 1. Выпустить server-сертификат (см. Quick Start, шаг 3)
+# 2. Создать цепочку (leaf + intermediate)
+cat pki/certs/example.com.cert.pem pki/certs/intermediate.cert.pem > chain.pem
+
+# 3. Запустить HTTPS-сервер
+python -c "
+import ssl, http.server
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+ctx.load_cert_chain('chain.pem', 'pki/certs/example.com.key.pem')
+httpd = http.server.HTTPServer(('0.0.0.0', 8443), http.server.SimpleHTTPRequestHandler)
+httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+httpd.serve_forever()
+"
+
+# 4. Проверить через openssl s_client
+openssl s_client -connect localhost:8443 -CAfile pki/certs/ca.cert.pem
+
+# 5. Или через curl
+curl --cacert pki/certs/ca.cert.pem https://localhost:8443/
+```
+
+---
+
+## Code Signing
+
+Подпись файла приватным ключом (RSA PKCS#1v15 SHA-256 или ECDSA SHA-256):
+
+```bash
+# Подписать файл
+python -m micropki client sign \
+    --key pki/certs/MicroPKI_Code_Signer.key.pem \
+    --file script.py \
+    --out script.py.sig
+
+# Проверить подпись
+python -m micropki client verify \
+    --cert pki/certs/MicroPKI_Code_Signer.cert.pem \
+    --file script.py \
+    --sig script.py.sig \
+    --trusted pki/certs/ca.cert.pem
+```
+
+Команда `verify` проверяет:
+- Криптографическую корректность подписи
+- Срок действия сертификата подписанта
+- Принадлежность сертификата к доверенной цепочке
+
+---
+
+## Architecture Diagram
+
+```mermaid
+graph TD
+    RootCA["Root CA\n(RSA-4096, самоподписанный)"]
+    IntCA["Intermediate CA\n(RSA-4096, pathlen=0)"]
+    ServerCert["Server Cert\n(SAN: dns/ip)"]
+    ClientCert["Client Cert\n(email SAN)"]
+    CodeCert["Code Signing Cert\n(EKU: codeSigning)"]
+    OCSPCert["OCSP Responder Cert\n(EKU: OCSPSigning)"]
+
+    DB[("SQLite DB\nmicropki.db")]
+    AuditLog["Audit Log\nNDJSON + SHA-256 цепочка"]
+    CTLog["CT Log\nct.log (симуляция)"]
+    CRL["CRL\n(PEM/DER)"]
+
+    RepoServer["HTTP Repository\n:8080"]
+    OCSPServer["OCSP Responder\n:8081"]
+
+    RootCA -->|подписывает| IntCA
+    IntCA -->|подписывает| ServerCert
+    IntCA -->|подписывает| ClientCert
+    IntCA -->|подписывает| CodeCert
+    IntCA -->|подписывает| OCSPCert
+
+    ServerCert -->|хранится в| DB
+    ClientCert -->|хранится в| DB
+    CodeCert -->|хранится в| DB
+
+    DB -->|обслуживает| RepoServer
+    DB -->|данные отзыва| OCSPServer
+    DB -->|данные отзыва| CRL
+
+    OCSPCert -->|используется| OCSPServer
+    IntCA -->|подписывает CRL| CRL
+
+    RootCA -->|каждая операция| AuditLog
+    IntCA -->|каждая операция| AuditLog
+    ServerCert -->|при выпуске| CTLog
+```
+
+---
+
+## Security Considerations
+
+Проект создан в образовательных целях. Перед использованием в продакшне учтите:
+
+- **Незашифрованные ключи конечных субъектов** — `client gen-csr` и `ca issue-cert`
+  сохраняют приватные ключи без шифрования. Защитите файл через FS-права или
+  зашифруйте вручную: `openssl pkcs8 -topk8 -in key.pem -out key.enc.pem`.
+
+- **Пароли в файлах** — `--passphrase-file` читает пароль из файла открытым текстом.
+  Используйте права доступа `600` и не храните файлы паролей в git.
+
+- **OCSP без HTTPS** — OCSP-респондер работает по plain HTTP. В реальной среде
+  оберните в nginx/caddy с TLS.
+
+- **Аудит-лог без внешней подписи** — SHA-256 хеш-цепочка защищает от тихой
+  модификации, но не от замены всего файла. Для production используйте append-only
+  хранилище или внешнюю подпись лога.
+
+- **SQLite без шифрования** — база данных хранится как обычный файл. Рассмотрите
+  шифрование на уровне файловой системы (LUKS, BitLocker, FileVault).
+
+- **Нет проверки OCSP при выдаче** — промежуточный CA не проверяет OCSP своего
+  издателя. В реальном PKI цепочка OCSP должна быть полной.
+
+- **Временны́е метки без NTP** — аудит-записи используют системное время. Убедитесь
+  что на сервере настроен NTP для корректного порядка записей.
+
+- **demo/demo.py не для продакшна** — скрипт генерирует случайные пароли и хранит
+  всё во временной директории. Не используйте его ключи/сертификаты где-либо ещё.

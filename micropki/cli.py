@@ -109,6 +109,8 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_client_request_cert_parser(client_subparsers)
     _add_client_validate_parser(client_subparsers)
     _add_client_check_status_parser(client_subparsers)
+    _add_client_sign_parser(client_subparsers)
+    _add_client_verify_parser(client_subparsers)
     client_parser.set_defaults(func=lambda args: (client_parser.print_help(sys.stderr) or 1))
 
     # ---- audit (Sprint 7) ----
@@ -119,6 +121,14 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_audit_query_parser(audit_subparsers)
     _add_audit_verify_parser(audit_subparsers)
     audit_parser.set_defaults(func=lambda args: (audit_parser.print_help(sys.stderr) or 1))
+
+    # ---- demo (Sprint 8) ----
+    demo_parser = subparsers.add_parser("demo", help="Автоматизированный демо-сценарий PKI (Спринт 8)")
+    demo_subparsers = demo_parser.add_subparsers(
+        title="подкоманды demo", dest="demo_command", help="Демо-операции",
+    )
+    _add_demo_run_parser(demo_subparsers)
+    demo_parser.set_defaults(func=lambda args: (demo_parser.print_help(sys.stderr) or 1))
 
     return parser
 
@@ -322,6 +332,27 @@ def _add_client_check_status_parser(sub) -> None:
     p.add_argument("--ocsp-url", default=None, help="Переопределить URL OCSP-респондера")
     p.add_argument("--log-file", default=None)
     p.set_defaults(func=_handle_client_check_status)
+
+
+def _add_client_sign_parser(sub) -> None:
+    """Спринт 8: подпись файла приватным ключом (detached RSA/ECDSA SHA-256)."""
+    p = sub.add_parser("sign", help="Подписать файл приватным ключом (Спринт 8)")
+    p.add_argument("--key", required=True, help="Путь к незашифрованному PEM-ключу")
+    p.add_argument("--file", required=True, dest="in_file", help="Путь к подписываемому файлу")
+    p.add_argument("--out", required=True, help="Путь для сохранения файла подписи (.sig)")
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_client_sign)
+
+
+def _add_client_verify_parser(sub) -> None:
+    """Спринт 8: верификация подписи файла с проверкой цепочки сертификата."""
+    p = sub.add_parser("verify", help="Проверить подпись файла (Спринт 8)")
+    p.add_argument("--cert", required=True, help="Сертификат подписанта (PEM)")
+    p.add_argument("--file", required=True, dest="in_file", help="Путь к проверяемому файлу")
+    p.add_argument("--sig", required=True, help="Путь к файлу подписи (.sig)")
+    p.add_argument("--trusted", required=True, help="PEM-bundle с доверенными корневыми сертификатами")
+    p.add_argument("--log-file", default=None)
+    p.set_defaults(func=_handle_client_verify)
 
 
 # ════════════════════════════════════════
@@ -755,6 +786,58 @@ def _handle_client_check_status(args: argparse.Namespace) -> int:
         return 1
 
 
+# ---- Спринт 8: client sign / client verify ----
+
+def _handle_client_sign(args: argparse.Namespace) -> int:
+    """Подписывает файл приватным ключом, сохраняет detached-подпись."""
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        from .crypto_utils import sign_file
+        _validate_file_exists(args.key, "Файл ключа")
+        _validate_file_exists(args.in_file, "Подписываемый файл")
+
+        sign_file(args.key, args.in_file, args.out)
+        print(f"Подпись сохранена: {args.out}")
+        return 0
+    except (ValueError, FileNotFoundError, OSError) as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Непредвиденная ошибка: %s", e)
+        return 1
+
+
+def _handle_client_verify(args: argparse.Namespace) -> int:
+    """Проверяет detached-подпись файла с валидацией цепочки сертификата."""
+    _ensure_log_dir(args)
+    log = setup_logger(args.log_file)
+    try:
+        from .crypto_utils import verify_file_signature
+        _validate_file_exists(args.cert, "Сертификат подписанта")
+        _validate_file_exists(args.in_file, "Проверяемый файл")
+        _validate_file_exists(args.sig, "Файл подписи")
+        _validate_file_exists(args.trusted, "Файл доверенных сертификатов")
+
+        ok, reason = verify_file_signature(args.cert, args.in_file, args.sig, args.trusted)
+        if ok:
+            print("Подпись действительна.")
+            return 0
+        else:
+            print(f"Подпись недействительна: {reason}", file=sys.stderr)
+            return 1
+    except (ValueError, FileNotFoundError, OSError) as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("%s", e)
+        return 1
+    except Exception as e:
+        print(f"Ошибка: {e}", file=sys.stderr)
+        log.error("Непредвиденная ошибка: %s", e)
+        return 1
+
+
 # ════════════════════════════════════════
 #  Форматировщики вывода
 # ════════════════════════════════════════
@@ -1044,3 +1127,24 @@ def _cmd_audit_verify(args) -> int:
         log.error("Ошибка audit verify: %s", exc)
         print(f"Ошибка: {exc}", file=sys.stderr)
         return 1
+
+
+# ============================================================
+#  Sprint 8: demo run
+# ============================================================
+
+def _add_demo_run_parser(sub) -> None:
+    """Субкоманда: micropki demo run — запускает полный демо-сценарий PKI."""
+    p = sub.add_parser("run", help="Запустить автоматизированный PKI демо-сценарий")
+    p.set_defaults(func=_cmd_demo_run)
+
+
+def _cmd_demo_run(_args) -> int:
+    """Запускает demo/demo.py через subprocess из корня пакета."""
+    import subprocess
+    demo_script = Path(__file__).parent.parent / "demo" / "demo.py"
+    if not demo_script.exists():
+        print(f"Ошибка: демо-скрипт не найден: {demo_script}", file=sys.stderr)
+        return 1
+    result = subprocess.run([sys.executable, str(demo_script)])
+    return result.returncode

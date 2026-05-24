@@ -2,16 +2,19 @@
 Криптографические утилиты для MicroPKI.
 
 Обрабатывает генерацию ключей (RSA-4096 / ECC P-384), шифрование/расшифрование PEM,
-и парсинг Отличительных Имен (Distinguished Name).
+парсинг Отличительных Имен (Distinguished Name), а также подпись и верификацию файлов.
 """
 
 from __future__ import annotations
 
 import re
+from pathlib import Path
 from typing import Union
 
+from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import ec, rsa
+from cryptography.hazmat.primitives.asymmetric import ec, padding, rsa
 from cryptography.hazmat.primitives.asymmetric.ec import EllipticCurvePrivateKey
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPrivateKey
 from cryptography.x509 import Name, NameAttribute
@@ -172,3 +175,139 @@ def get_signature_algorithm(key: PrivateKey) -> hashes.HashAlgorithm:
         return hashes.SHA256()
     else:
         return hashes.SHA384()
+
+
+def sign_file(key_path: str | Path, file_path: str | Path, out_path: str | Path) -> None:
+    """
+    Подписывает файл приватным ключом (RSA PKCS#1v15 SHA-256 или ECDSA SHA-256).
+
+    Подпись сохраняется как бинарный detached-файл (DER-байты подписи).
+
+    Аргументы:
+        key_path:  путь к незашифрованному PEM-ключу
+        file_path: путь к подписываемому файлу
+        out_path:  путь для сохранения файла подписи (.sig)
+
+    Вызывает исключения:
+        ValueError: если ключ не поддерживается
+        FileNotFoundError: если файлы не найдены
+    """
+    key_pem = Path(key_path).read_bytes()
+    # Незашифрованный ключ — password=None
+    private_key = serialization.load_pem_private_key(key_pem, password=None)
+
+    data = Path(file_path).read_bytes()
+
+    if isinstance(private_key, RSAPrivateKey):
+        signature = private_key.sign(data, padding.PKCS1v15(), hashes.SHA256())
+    elif isinstance(private_key, EllipticCurvePrivateKey):
+        signature = private_key.sign(data, ec.ECDSA(hashes.SHA256()))
+    else:
+        raise ValueError(f"Неподдерживаемый тип ключа: {type(private_key).__name__}")
+
+    Path(out_path).write_bytes(signature)
+
+
+def verify_file_signature(
+    cert_path: str | Path,
+    file_path: str | Path,
+    sig_path: str | Path,
+    trusted_path: str | Path,
+) -> tuple[bool, str]:
+    """
+    Проверяет detached-подпись файла.
+
+    Дополнительно проверяет цепочку сертификата до доверенного корня.
+
+    Аргументы:
+        cert_path:    путь к сертификату подписанта (PEM)
+        file_path:    путь к файлу, подпись которого проверяем
+        sig_path:     путь к файлу подписи (бинарный .sig)
+        trusted_path: PEM-файл с доверенными корневыми сертификатами (bundle)
+
+    Возвращает:
+        (True, "") если всё ок
+        (False, "причина") при ошибке
+    """
+    # Загружаем сертификат подписанта
+    try:
+        cert_pem = Path(cert_path).read_bytes()
+        cert = x509.load_pem_x509_certificate(cert_pem)
+    except Exception as e:
+        return False, f"Не удалось загрузить сертификат: {e}"
+
+    # Проверяем срок действия сертификата
+    from datetime import datetime, timezone
+    now = datetime.now(tz=timezone.utc)
+    if now < cert.not_valid_before_utc:
+        return False, f"Сертификат ещё не действителен (notBefore={cert.not_valid_before_utc})"
+    if now > cert.not_valid_after_utc:
+        return False, f"Сертификат истёк (notAfter={cert.not_valid_after_utc})"
+
+    # Простая проверка цепочки до доверенного корня
+    trusted_pem_data = Path(trusted_path).read_bytes()
+    # Разбиваем bundle на отдельные PEM-блоки
+    trusted_certs: list[x509.Certificate] = []
+    pem_blocks = _split_pem_bundle(trusted_pem_data)
+    for block in pem_blocks:
+        try:
+            trusted_certs.append(x509.load_pem_x509_certificate(block))
+        except Exception:
+            continue
+
+    if not trusted_certs:
+        return False, "Нет доверенных сертификатов в bundle"
+
+    # Ищем хоть один доверенный сертификат, который подписал наш cert
+    chain_ok = False
+    cert_issuer = cert.issuer.rfc4514_string()
+    for tc in trusted_certs:
+        if tc.subject.rfc4514_string() == cert_issuer:
+            pub = tc.public_key()
+            try:
+                if isinstance(pub, rsa.RSAPublicKey):
+                    pub.verify(cert.signature, cert.tbs_certificate_bytes,
+                               padding.PKCS1v15(), cert.signature_hash_algorithm)
+                elif isinstance(pub, ec.EllipticCurvePublicKey):
+                    pub.verify(cert.signature, cert.tbs_certificate_bytes,
+                               ec.ECDSA(cert.signature_hash_algorithm))
+                chain_ok = True
+                break
+            except InvalidSignature:
+                continue
+
+    if not chain_ok:
+        return False, "Сертификат не прошёл проверку цепочки до доверенного корня"
+
+    # Проверяем саму подпись файла
+    data = Path(file_path).read_bytes()
+    signature = Path(sig_path).read_bytes()
+    pub_key = cert.public_key()
+
+    try:
+        if isinstance(pub_key, rsa.RSAPublicKey):
+            pub_key.verify(signature, data, padding.PKCS1v15(), hashes.SHA256())
+        elif isinstance(pub_key, ec.EllipticCurvePublicKey):
+            pub_key.verify(signature, data, ec.ECDSA(hashes.SHA256()))
+        else:
+            return False, f"Неподдерживаемый тип публичного ключа: {type(pub_key).__name__}"
+    except InvalidSignature:
+        return False, "Подпись недействительна (файл изменён или неверный ключ)"
+
+    return True, ""
+
+
+def _split_pem_bundle(pem_data: bytes) -> list[bytes]:
+    """Разбивает PEM-bundle с несколькими сертификатами на список отдельных PEM-блоков."""
+    blocks = []
+    current: list[bytes] = []
+    for line in pem_data.splitlines(keepends=True):
+        if line.strip().startswith(b"-----BEGIN"):
+            current = [line]
+        elif line.strip().startswith(b"-----END") and current:
+            current.append(line)
+            blocks.append(b"".join(current))
+            current = []
+        elif current:
+            current.append(line)
+    return blocks
